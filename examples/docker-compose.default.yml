@@ -1,0 +1,14 @@
+# Run memory-mcp with a local ./data directory for the SQLite DB.
+
+services:
+  memory-mcp:
+    image: ghcr.io/dolphin2702/memory-mcp:v0.1.0
+    container_name: memory-mcp
+    restart: unless-stopped
+    environment:
+      DB_PATH: /data/memory.db
+      PORT: "8765"
+    volumes:
+      - ./data:/data
+    ports:
+      - "8765:8765"

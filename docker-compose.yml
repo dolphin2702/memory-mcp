@@ -1,0 +1,13 @@
+services:
+  memory-mcp:
+    image: ${MEMORY_MCP_IMAGE:-memory-mcp:local}
+    build: .
+    container_name: memory-mcp
+    restart: unless-stopped
+    environment:
+      DB_PATH: /data/memory.db
+      PORT: "8765"
+    volumes:
+      - ./data:/data
+    ports:
+      - "8765:8765"

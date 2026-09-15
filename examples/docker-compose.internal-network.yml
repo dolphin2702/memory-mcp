@@ -1,0 +1,19 @@
+# Run memory-mcp inside a shared Docker network (e.g. mcp_internal),
+# without exposing the port to the host.
+
+services:
+  memory-mcp:
+    image: ghcr.io/dolphin2702/memory-mcp:v0.1.0
+    container_name: memory-mcp
+    restart: unless-stopped
+    environment:
+      DB_PATH: /data/memory.db
+      PORT: "8765"
+    volumes:
+      - ./data:/data
+    networks:
+      - mcp_internal
+
+networks:
+  mcp_internal:
+    external: true
