@@ -60,7 +60,8 @@ async def lifespan(app: FastAPI):
     logger.info("DB initialized at %s", DB_PATH)
     yield
 
-app = FastAPI()
+
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
