@@ -7,6 +7,8 @@ import time
 import uuid
 from typing import Dict, Optional
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -20,6 +22,7 @@ DB_PATH = os.environ.get("DB_PATH", "/data/memory.db")
 def init_db() -> None:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with sqlite3.connect(DB_PATH) as conn:
+        # Main table
         conn.execute("""
             CREATE TABLE IF NOT EXISTS memories (
                 id TEXT PRIMARY KEY,
@@ -30,8 +33,32 @@ def init_db() -> None:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_user_id ON memories(user_id)")
 
+        # Migration: add deleted_at column for soft delete
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(memories)").fetchall()]
+        if "deleted_at" not in cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN deleted_at INTEGER")
+            logger.info("Migration: added deleted_at column")
 
-init_db()
+        # Audit log
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp INTEGER NOT NULL,
+                action TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                memory_id TEXT,
+                text TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_log(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(timestamp)")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    logger.info("DB initialized at %s", DB_PATH)
+    yield
 
 app = FastAPI()
 app.add_middleware(
@@ -44,6 +71,15 @@ app.add_middleware(
 )
 
 sessions: Dict[str, asyncio.Queue] = {}
+
+
+# ===================== AUDIT LOG =====================
+def _log_audit(cur: sqlite3.Cursor, action: str, user_id: str,
+               memory_id: Optional[str], text: Optional[str]) -> None:
+    cur.execute(
+        "INSERT INTO audit_log (timestamp, action, user_id, memory_id, text) VALUES (?, ?, ?, ?, ?)",
+        (int(time.time()), action, user_id, memory_id, text),
+    )
 
 
 # ===================== ОСНОВНОЙ ЭНДПОИНТ ДЛЯ OPEN WEBUI =====================
@@ -75,7 +111,7 @@ async def mcp_get_endpoint():
     })
 
 
-# ===================== SSE ЭНДПОИНТ ДЛЯ ЛЕГАСИ-КЛИЕНТОВ =====================
+# ===================== SSE ЭНДПОИНТ =====================
 @app.get("/sse")
 async def sse_endpoint(request: Request):
     session_id = str(uuid.uuid4())
@@ -131,7 +167,7 @@ async def messages_endpoint(request: Request):
     return JSONResponse({"status": "accepted"})
 
 
-# ===================== ВСПОМОГАТЕЛЬНЫЕ ЭНДПОИНТЫ =====================
+# ===================== ВСПОМОГАТЕЛЬНЫЕ =====================
 @app.get("/")
 async def root_get():
     return JSONResponse({"status": "ok", "message": "MCP Memory Server is running"})
@@ -169,7 +205,7 @@ async def websocket_endpoint(websocket: WebSocket):
         logger.info("WebSocket disconnected")
 
 
-# ===================== ОСНОВНАЯ ЛОГИКА ОБРАБОТКИ JSON-RPC =====================
+# ===================== ОСНОВНАЯ ЛОГИКА =====================
 async def process_request(body: dict, request: Optional[Request] = None) -> dict:
     method = body.get("method")
     req_id = body.get("id")
@@ -211,7 +247,7 @@ async def process_request(body: dict, request: Optional[Request] = None) -> dict
                     },
                     {
                         "name": "search_memory",
-                        "description": "Search memory by substring.",
+                        "description": "Search memory by substring. Returns only active (non-deleted) records.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -235,7 +271,7 @@ async def process_request(body: dict, request: Optional[Request] = None) -> dict
                     },
                     {
                         "name": "list_memories",
-                        "description": "List all memories for a user.",
+                        "description": "List all active memories for a user.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -245,7 +281,7 @@ async def process_request(body: dict, request: Optional[Request] = None) -> dict
                     },
                     {
                         "name": "get_memory",
-                        "description": "Get a single memory by ID.",
+                        "description": "Get a single active memory by ID.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -257,7 +293,7 @@ async def process_request(body: dict, request: Optional[Request] = None) -> dict
                     },
                     {
                         "name": "delete_memories",
-                        "description": "Delete memories by IDs.",
+                        "description": "Soft-delete memories by IDs. Records can be restored later with restore_memories. Use only when the user explicitly asks to forget something.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -272,13 +308,43 @@ async def process_request(body: dict, request: Optional[Request] = None) -> dict
                     },
                     {
                         "name": "delete_all_memories",
-                        "description": "Delete all memories for a user.",
+                        "description": "Soft-delete ALL memories for a user. Requires confirm=true. Records can be restored later with restore_memories.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "user_id": {"type": "string"},
+                                "confirm": {
+                                    "type": "boolean",
+                                    "description": "Must be true to proceed",
+                                },
                             },
-                            "required": ["user_id"],
+                            "required": ["user_id", "confirm"],
+                        },
+                    },
+                    {
+                        "name": "memory_history",
+                        "description": "Audit log: shows recent add/delete/restore actions for a user with full text.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "user_id": {"type": "string", "default": "default"},
+                                "limit": {"type": "integer", "default": 50},
+                            },
+                        },
+                    },
+                    {
+                        "name": "restore_memories",
+                        "description": "Restore previously soft-deleted memories by ID.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "memory_ids": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                                "user_id": {"type": "string", "default": "default"},
+                            },
+                            "required": ["memory_ids"],
                         },
                     },
                 ]
@@ -302,6 +368,7 @@ async def process_request(body: dict, request: Optional[Request] = None) -> dict
         if not user_id:
             user_id = "default"
 
+        # Validate required args
         if tool_name == "add_memories" and "text" not in args:
             return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": "Missing text"}}
         if tool_name in ("search_memory", "search_memories") and "query" not in args:
@@ -310,6 +377,10 @@ async def process_request(body: dict, request: Optional[Request] = None) -> dict
             return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": "Missing memory_id"}}
         if tool_name == "delete_memories" and "memory_ids" not in args:
             return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": "Missing memory_ids"}}
+        if tool_name == "restore_memories" and "memory_ids" not in args:
+            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": "Missing memory_ids"}}
+        if tool_name == "delete_all_memories" and not args.get("confirm"):
+            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": "delete_all_memories requires confirm=true"}}
 
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
@@ -318,10 +389,12 @@ async def process_request(body: dict, request: Optional[Request] = None) -> dict
         try:
             if tool_name == "add_memories":
                 mem_id = str(uuid.uuid4())
+                text = args["text"]
                 cur.execute(
                     "INSERT INTO memories (id, text, user_id, created_at) VALUES (?, ?, ?, ?)",
-                    (mem_id, args["text"], user_id, int(time.time())),
+                    (mem_id, text, user_id, int(time.time())),
                 )
+                _log_audit(cur, "add", user_id, mem_id, text)
                 conn.commit()
                 return {
                     "jsonrpc": "2.0",
@@ -331,7 +404,7 @@ async def process_request(body: dict, request: Optional[Request] = None) -> dict
 
             if tool_name in ("search_memory", "search_memories"):
                 cur.execute(
-                    "SELECT id, text FROM memories WHERE user_id = ? AND text LIKE ? ORDER BY created_at DESC LIMIT 5",
+                    "SELECT id, text FROM memories WHERE user_id = ? AND deleted_at IS NULL AND text LIKE ? ORDER BY created_at DESC LIMIT 5",
                     (user_id, f"%{args['query']}%"),
                 )
                 rows = cur.fetchall()
@@ -340,7 +413,7 @@ async def process_request(body: dict, request: Optional[Request] = None) -> dict
 
             if tool_name == "list_memories":
                 cur.execute(
-                    "SELECT id, text, created_at FROM memories WHERE user_id = ? ORDER BY created_at DESC",
+                    "SELECT id, text, created_at FROM memories WHERE user_id = ? AND deleted_at IS NULL ORDER BY created_at DESC",
                     (user_id,),
                 )
                 rows = cur.fetchall()
@@ -349,7 +422,7 @@ async def process_request(body: dict, request: Optional[Request] = None) -> dict
 
             if tool_name == "get_memory":
                 cur.execute(
-                    "SELECT text, created_at FROM memories WHERE id = ? AND user_id = ?",
+                    "SELECT text, created_at FROM memories WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
                     (args["memory_id"], user_id),
                 )
                 row = cur.fetchone()
@@ -361,19 +434,85 @@ async def process_request(body: dict, request: Optional[Request] = None) -> dict
                 if not ids:
                     return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "⚠️ Список пуст"}]}}
                 placeholders = ",".join("?" * len(ids))
+                # Fetch texts for audit before updating
                 cur.execute(
-                    f"DELETE FROM memories WHERE id IN ({placeholders}) AND user_id = ?",
+                    f"SELECT id, text FROM memories WHERE id IN ({placeholders}) AND user_id = ? AND deleted_at IS NULL",
                     ids + [user_id],
                 )
-                deleted = cur.rowcount
+                to_delete = cur.fetchall()
+                now = int(time.time())
+                for row in to_delete:
+                    cur.execute(
+                        "UPDATE memories SET deleted_at = ? WHERE id = ? AND user_id = ?",
+                        (now, row["id"], user_id),
+                    )
+                    _log_audit(cur, "delete", user_id, row["id"], row["text"])
                 conn.commit()
-                return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"🗑️ Удалено: {deleted}"}]}}
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {"content": [{"type": "text", "text": f"🗑️ Помечено удалёнными: {len(to_delete)}. Восстановить: restore_memories(memory_ids=[...], user_id=\"{user_id}\")"}]},
+                }
 
             if tool_name == "delete_all_memories":
-                cur.execute("DELETE FROM memories WHERE user_id = ?", (user_id,))
-                deleted = cur.rowcount
+                cur.execute(
+                    "SELECT id, text FROM memories WHERE user_id = ? AND deleted_at IS NULL",
+                    (user_id,),
+                )
+                rows = cur.fetchall()
+                now = int(time.time())
+                for row in rows:
+                    cur.execute(
+                        "UPDATE memories SET deleted_at = ? WHERE id = ? AND user_id = ?",
+                        (now, row["id"], user_id),
+                    )
+                    _log_audit(cur, "delete", user_id, row["id"], row["text"])
                 conn.commit()
-                return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": f"🗑️ Удалено: {deleted}"}]}}
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {"content": [{"type": "text", "text": f"🗑️ Помечено удалёнными: {len(rows)}. Восстановить: memory_history + restore_memories"}]},
+                }
+
+            if tool_name == "memory_history":
+                limit = int(args.get("limit", 50))
+                cur.execute(
+                    "SELECT timestamp, action, memory_id, text FROM audit_log WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?",
+                    (user_id, limit),
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "❌ История пуста"}]}}
+                lines = []
+                for r in rows:
+                    ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(r["timestamp"]))
+                    action_icon = {"add": "➕", "delete": "🗑️", "restore": "♻️"}.get(r["action"], "•")
+                    snippet = (r["text"] or "")[:80]
+                    lines.append(f"{action_icon} [{ts}] {r['action']} [{r['memory_id'][:8] if r['memory_id'] else '?'}] {snippet}")
+                return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "\n".join(lines)}]}}
+
+            if tool_name == "restore_memories":
+                ids = args["memory_ids"]
+                if not ids:
+                    return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "⚠️ Список пуст"}]}}
+                placeholders = ",".join("?" * len(ids))
+                cur.execute(
+                    f"SELECT id, text FROM memories WHERE id IN ({placeholders}) AND user_id = ? AND deleted_at IS NOT NULL",
+                    ids + [user_id],
+                )
+                to_restore = cur.fetchall()
+                for row in to_restore:
+                    cur.execute(
+                        "UPDATE memories SET deleted_at = NULL WHERE id = ? AND user_id = ?",
+                        (row["id"], user_id),
+                    )
+                    _log_audit(cur, "restore", user_id, row["id"], row["text"])
+                conn.commit()
+                return {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "result": {"content": [{"type": "text", "text": f"♻️ Восстановлено: {len(to_restore)}"}]},
+                }
 
             return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}}
 
